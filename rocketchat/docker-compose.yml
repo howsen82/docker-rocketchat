@@ -1,0 +1,162 @@
+# Rocket.Chat with Let's Encrypt Using Docker Compose
+
+# Change variables in the `.env` to meet your requirements.
+# Note that the `.env` file should be in the same directory as `docker-compose.yml`.
+
+# Create networks for your services before deploying the configuration using the commands
+# docker network create traefik-network
+# docker network create rocketchat-network
+
+# Deploy Rocket.Chat using Docker Compose:
+# docker compose -p rocketchat up -d
+
+version: '3.9'
+
+services:
+  mongodb:
+    image: ${ROCKETCHAT_MONGODB_IMAGE_TAG}
+    environment:
+      MONGODB_REPLICA_SET_MODE: primary
+      MONGODB_REPLICA_SET_NAME: rs0
+      MONGODB_PORT_NUMBER: 27017
+      MONGODB_INITIAL_PRIMARY_HOST: mongodb
+      MONGODB_INITIAL_PRIMARY_PORT_NUMBER: 27017
+      MONGODB_ADVERTISED_HOSTNAME: mongodb
+      MONGODB_ENABLE_JOURNAL: 'true'
+      ALLOW_EMPTY_PASSWORD: 'yes'
+    volumes:
+     - rocketchat-mongodb:/bitnami/mongodb
+    networks:
+      - rocketchat-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  rocketchat:
+    image: ${ROCKETCHAT_IMAGE_TAG}
+    environment:
+      PORT: 3000
+      ROOT_URL: ${ROCKETCHAT_URL}
+      MONGO_URL: mongodb://mongodb:27017/rocketchat?replicaSet=rs0
+      MONGO_OPLOG_URL: mongodb://mongodb:27017/local?replicaSet=rs0
+      DEPLOY_METHOD: docker
+      Accounts_UseDNSDomainCheck: 'false'
+    volumes:
+      - rocketchat-uploads:/app/uploads
+    networks:
+      - rocketchat-network
+      - traefik-network
+    restart: unless-stopped
+    healthcheck:
+      test: >
+         /usr/local/bin/node -e '
+         const http = require("http");
+         const options = {
+           host: "localhost",
+           port: 3000,
+           path: "/api/info",
+           timeout: 2000
+         };
+         const healthCheck = http.request(options, (res) => {
+           console.log(`HEALTHCHECK STATUS: $${res.statusCode}`);
+           if (res.statusCode == 200) {
+             process.exit(0);
+           } else {
+             process.exit(1);
+           }
+         });
+         healthCheck.on("error", function (err) {
+           console.error("ERROR");
+           process.exit(1);
+         });
+         healthCheck.end();'
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.rocketchat.rule=Host(`${ROCKETCHAT_HOSTNAME}`)"
+      - "traefik.http.routers.rocketchat.service=rocketchat"
+      - "traefik.http.routers.rocketchat.entrypoints=websecure"
+      - "traefik.http.services.rocketchat.loadbalancer.server.port=3000"
+      - "traefik.http.routers.rocketchat.tls=true"
+      - "traefik.http.routers.rocketchat.tls.certresolver=letsencrypt"
+      - "traefik.http.services.rocketchat.loadbalancer.passhostheader=true"
+      - "traefik.http.routers.rocketchat.middlewares=compresstraefik"
+      - "traefik.http.middlewares.compresstraefik.compress=true"
+      - "traefik.docker.network=traefik-network"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      traefik:
+        condition: service_healthy
+
+  traefik:
+    image: ${TRAEFIK_IMAGE_TAG}
+    command:
+      - "--log.level=${TRAEFIK_LOG_LEVEL}"
+      - "--accesslog=true"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--ping=true"
+      - "--ping.entrypoint=ping"
+      - "--entryPoints.ping.address=:8082"
+      - "--entryPoints.web.address=:80"
+      - "--entryPoints.websecure.address=:443"
+      - "--entryPoints.calls.address=:8443/udp"
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      - "--providers.docker.exposedByDefault=false"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${TRAEFIK_ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/etc/traefik/acme/acme.json"
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0"
+      - "--global.checkNewVersion=true"
+      - "--global.sendAnonymousUsage=false"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - traefik-certificates:/etc/traefik/acme
+    networks:
+      - traefik-network
+    ports:
+      - 80:80
+      - 443:443
+    healthcheck:
+      test: ["CMD", "wget", "http://localhost:8082/ping","--spider"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_HOSTNAME}`)"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=8080"
+      - "traefik.http.routers.dashboard.tls=true"
+      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.services.dashboard.loadbalancer.passhostheader=true"
+      - "traefik.http.routers.dashboard.middlewares=authtraefik"
+      - "traefik.http.middlewares.authtraefik.basicauth.users=${TRAEFIK_BASIC_AUTH}"
+      - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+    restart: unless-stopped
+
+volumes:
+  rocketchat-uploads:
+  rocketchat-mongodb:
+  traefik-certificates:
+
+networks:
+  rocketchat-network:
+    external: true
+  traefik-network:
+    external: true
